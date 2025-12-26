@@ -56,8 +56,8 @@ run_worker_first = ["/api/*", "/identity/*"]
 crons = ["0 3 * * *"]
 
 [[d1_databases]]
-binding = "vault1"
-database_name = "vault1"
+binding = "Studio"
+database_name = "Studio"
 database_id = "${D1_DATABASE_ID}"
 migrations_dir = "migrations"
 
