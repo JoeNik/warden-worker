@@ -1,8 +1,9 @@
 use axum::{extract::State, Json};
 use serde_json::Value;
 use std::sync::Arc;
-use worker::{query, Env};
+use worker::Env;
 
+use crate::d1_query;
 use crate::{
     auth::AuthUser,
     crypto::{base32_decode, ct_eq, generate_recovery_code, generate_totp_secret, validate_totp},
@@ -10,11 +11,35 @@ use crate::{
     error::AppError,
     handlers::allow_totp_drift,
     models::twofactor::{
-        DisableAuthenticatorData, DisableTwoFactorData, EnableAuthenticatorData, RecoverTwoFactor,
-        TwoFactor, TwoFactorType,
+        DisableAuthenticatorData, DisableTwoFactorData, EnableAuthenticatorData, TwoFactor,
+        TwoFactorType,
     },
     models::user::{PasswordOrOtpData, User},
 };
+
+/// List all 2FA records for a user (excludes atype >= 1000).
+pub(crate) async fn list_user_twofactors(
+    db: &crate::db::Db,
+    user_id: &str,
+) -> Result<Vec<TwoFactor>, AppError> {
+    db.prepare("SELECT * FROM twofactor WHERE user_uuid = ?1 AND atype < 1000")
+        .bind(&[user_id.to_string().into()])?
+        .all()
+        .await
+        .map_err(|_| AppError::Database)?
+        .results::<TwoFactor>()
+        .map_err(|_| AppError::Database)
+}
+
+/// Whether the user has 2FA enabled.
+///
+/// For now, we intentionally only treat Authenticator (TOTP) as a real 2FA provider.
+/// Remember-device tokens are never considered a 2FA method by themselves.
+pub(crate) fn is_twofactor_enabled(twofactors: &[TwoFactor]) -> bool {
+    twofactors
+        .iter()
+        .any(|tf| tf.enabled && tf.atype == TwoFactorType::Authenticator as i32)
+}
 
 /// GET /api/two-factor - Get all enabled 2FA providers for current user
 #[worker::send]
@@ -24,17 +49,8 @@ pub async fn get_twofactor(
 ) -> Result<Json<Value>, AppError> {
     let db = db::get_db(&env)?;
 
-    let twofactors: Vec<Value> = db
-        .prepare("SELECT * FROM twofactor WHERE user_uuid = ?1 AND atype < 1000")
-        .bind(&[user_id.clone().into()])?
-        .all()
-        .await
-        .map_err(|_| AppError::Database)?
-        .results::<TwoFactor>()
-        .map_err(|_| AppError::Database)?
-        .iter()
-        .map(|tf| tf.to_json_provider())
-        .collect();
+    let twofactors = list_user_twofactors(&db, &user_id).await?;
+    let twofactors: Vec<Value> = twofactors.iter().map(|tf| tf.to_json_provider()).collect();
 
     Ok(Json(serde_json::json!({
         "data": twofactors,
@@ -147,7 +163,7 @@ pub async fn activate_authenticator(
     let last_used_step = validate_totp(&data.token, &key, previous_last_used, allow_drift).await?;
 
     // Delete existing TOTP and any remember-device tokens bound to it to avoid stale bypass
-    query!(
+    d1_query!(
         &db,
         "DELETE FROM twofactor WHERE user_uuid = ?1 AND atype IN (?2, ?3)",
         &user_id,
@@ -163,7 +179,7 @@ pub async fn activate_authenticator(
     let mut twofactor = TwoFactor::new(user_id.clone(), TwoFactorType::Authenticator, key.clone());
     twofactor.last_used = last_used_step;
 
-    query!(
+    d1_query!(
         &db,
         "INSERT INTO twofactor (uuid, user_uuid, atype, enabled, data, last_used) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         &twofactor.uuid,
@@ -229,7 +245,7 @@ pub async fn disable_twofactor(
     let type_ = data.r#type;
 
     // Delete the specified 2FA type
-    query!(
+    d1_query!(
         &db,
         "DELETE FROM twofactor WHERE user_uuid = ?1 AND atype = ?2",
         &user_id,
@@ -304,7 +320,7 @@ pub async fn disable_authenticator(
         ));
     }
 
-    query!(&db, "DELETE FROM twofactor WHERE uuid = ?1", &tf.uuid)
+    d1_query!(&db, "DELETE FROM twofactor WHERE uuid = ?1", &tf.uuid)
         .map_err(|_| AppError::Database)?
         .run()
         .await
@@ -362,71 +378,6 @@ pub async fn get_recover(
     })))
 }
 
-/// POST /api/two-factor/recover - Use recovery code to disable all 2FA
-#[worker::send]
-pub async fn recover(
-    State(env): State<Arc<Env>>,
-    Json(data): Json<RecoverTwoFactor>,
-) -> Result<Json<Value>, AppError> {
-    let db = db::get_db(&env)?;
-
-    // Get user by email
-    let user_value: Value = db
-        .prepare("SELECT * FROM users WHERE email = ?1")
-        .bind(&[data.email.to_lowercase().into()])?
-        .first(None)
-        .await
-        .map_err(|_| AppError::Database)?
-        .ok_or_else(|| AppError::Unauthorized("Username or password is incorrect".to_string()))?;
-    let user: User = serde_json::from_value(user_value).map_err(|_| AppError::Internal)?;
-
-    // Verify master password
-    let verification = user
-        .verify_master_password(&data.master_password_hash)
-        .await?;
-    if !verification.is_valid() {
-        return Err(AppError::Unauthorized(
-            "Username or password is incorrect".to_string(),
-        ));
-    }
-
-    // Check recovery code (case-insensitive)
-    let is_valid = user.totp_recover.as_ref().is_some_and(|stored_code| {
-        ct_eq(
-            &stored_code.to_uppercase(),
-            &data.recovery_code.to_uppercase(),
-        )
-    });
-
-    if !is_valid {
-        return Err(AppError::BadRequest(
-            "Recovery code is incorrect. Try again.".to_string(),
-        ));
-    }
-
-    // Delete all 2FA methods
-    query!(&db, "DELETE FROM twofactor WHERE user_uuid = ?1", &user.id)
-        .map_err(|_| AppError::Database)?
-        .run()
-        .await
-        .map_err(|_| AppError::Database)?;
-
-    // Clear recovery code
-    query!(
-        &db,
-        "UPDATE users SET totp_recover = NULL WHERE id = ?1",
-        &user.id
-    )
-    .map_err(|_| AppError::Database)?
-    .run()
-    .await
-    .map_err(|_| AppError::Database)?;
-
-    log::info!("User {} recovered 2FA using recovery code", user.id);
-
-    Ok(Json(serde_json::json!({})))
-}
-
 // Helper functions
 
 async fn validate_password_or_otp(user: &User, data: &PasswordOrOtpData) -> Result<(), AppError> {
@@ -444,7 +395,7 @@ async fn validate_password_or_otp(user: &User, data: &PasswordOrOtpData) -> Resu
 }
 
 async fn generate_recovery_code_for_user(
-    db: &worker::D1Database,
+    db: &crate::db::Db,
     user_id: &str,
 ) -> Result<(), AppError> {
     // Check if recovery code already exists
@@ -463,7 +414,7 @@ async fn generate_recovery_code_for_user(
 
     if totp_recover.is_none() {
         let recovery_code = generate_recovery_code()?;
-        query!(
+        d1_query!(
             db,
             "UPDATE users SET totp_recover = ?1 WHERE id = ?2",
             &recovery_code,
@@ -479,10 +430,7 @@ async fn generate_recovery_code_for_user(
 }
 
 /// Clear recovery code when no real 2FA providers remain.
-async fn clear_recovery_if_no_twofactor(
-    db: &worker::D1Database,
-    user_id: &str,
-) -> Result<(), AppError> {
+async fn clear_recovery_if_no_twofactor(db: &crate::db::Db, user_id: &str) -> Result<(), AppError> {
     let remaining: Vec<TwoFactor> = db
         .prepare("SELECT * FROM twofactor WHERE user_uuid = ?1 AND atype < 1000 AND atype != ?2")
         .bind(&[
@@ -496,7 +444,7 @@ async fn clear_recovery_if_no_twofactor(
         .map_err(|_| AppError::Database)?;
 
     if remaining.is_empty() {
-        query!(
+        d1_query!(
             db,
             "UPDATE users SET totp_recover = NULL WHERE id = ?1",
             user_id
